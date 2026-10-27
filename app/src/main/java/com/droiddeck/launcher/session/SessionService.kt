@@ -488,6 +488,7 @@ class SessionService : Service() {
                 .onSuccess { if (it != null) Log.i(TAG, it) }
                 .onFailure { Log.w(TAG, "forced components", it) }
         }
+        if (com.droiddeck.launcher.core.DeviceSupport.mali() && LinuxRuntime.softwareVulkanIcd(this) == null) installLavapipe(sessionLog)
         addClientEnvironment(guest, steamHere, agentEnvironment)
         if (steamHere) guest.add("BL_EPIC_APP_ID=" + com.droiddeck.launcher.stores.epic.EpicClient.shortcutAppId)
         val fastPathAt = guest.size
@@ -726,6 +727,18 @@ class SessionService : Service() {
         SessionLogCapture.start(File(sessionDir, "app.log"))
         MemoryLog.start()
         return sessionDir
+    }
+
+    private fun installLavapipe(sessionLog: File) {
+        Log.i(TAG, "Mali GPU: the runtime has no lavapipe, fetching it from Arch Linux ARM")
+        val status = runCatching {
+            com.droiddeck.launcher.runtime.GuestCommand.run(this, listOf("/bin/bash", "/usr/local/bin/droiddeck-lavapipe-setup"),
+                fakeRoot = true, logName = "lavapipe-setup") { line ->
+                Log.i(TAG, "lavapipe: $line")
+                runCatching { sessionLog.appendText("== lavapipe: $line\n") }
+            }
+        }.onFailure { Log.w(TAG, "lavapipe setup", it) }.getOrDefault(-1)
+        Log.i(TAG, "lavapipe setup exited $status, manifest ${LinuxRuntime.softwareVulkanIcd(this)?.path ?: "none"}")
     }
 
     private fun addClientEnvironment(guest: MutableList<String>, steamHere: Boolean, agentEnvironment: List<String>) {
