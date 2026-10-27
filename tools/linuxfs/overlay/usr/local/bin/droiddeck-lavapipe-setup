@@ -1,0 +1,88 @@
+#!/bin/bash
+# Mali: the runtime ships no software Vulkan driver, and gamescope needs one.
+set -u
+export LANG=C.UTF-8
+step() { echo "== STEP $*"; }
+fail() { echo "== FAIL $*"; exit 1; }
+[ "$(id -u)" = 0 ] || fail "needs root: the app runs this as root before a Mali session"
+
+ICD=/usr/share/vulkan/icd.d
+compgen -G "$ICD/lvp_icd*.json" >/dev/null && { echo "== DONE already installed"; exit 0; }
+
+WORK=/var/cache/droiddeck-lavapipe
+CONF=$WORK/pacman.conf
+mkdir -p "$WORK/pkg" "$WORK/db" || fail "cannot create $WORK"
+exec 9>"$WORK/setup.lock" && flock -n 9 || fail "another lavapipe setup is still running"
+
+{ for m in https://ca.us.mirror.archlinuxarm.org https://fl.us.mirror.archlinuxarm.org \
+           https://de3.mirror.archlinuxarm.org https://nl.mirror.archlinuxarm.org; do
+    echo "Server = $m/\$arch/\$repo"; done
+  grep '^Server' /etc/pacman.d/mirrorlist 2>/dev/null; } > "$WORK/mirrorlist"
+sed -e 's/^DownloadUser/#DownloadUser/' \
+    -e 's/^\[options\]/[options]\nDisableSandbox/' \
+    -e "s#^Include *= */etc/pacman.d/mirrorlist#Include = $WORK/mirrorlist#" \
+    /etc/pacman.conf > "$CONF" || fail "no /etc/pacman.conf"
+
+if [ ! -f /etc/pacman.d/gnupg/pubring.gpg ] && [ ! -f /etc/pacman.d/gnupg/pubring.kbx ]; then
+  step "Preparing the package keyring"
+  pacman-key --init >/dev/null 2>&1 || fail "pacman-key --init failed"
+  pacman-key --populate archlinuxarm >/dev/null 2>&1 || fail "pacman-key --populate failed"
+fi
+
+step "Reading the package lists"
+rm -f "$WORK/db/db.lck"
+sync_log=$(pacman --config "$CONF" --dbpath "$WORK/db" --noconfirm -Sy 2>&1) \
+  || sync_log=$(pacman --config "$CONF" --dbpath "$WORK/db" --noconfirm -Sy 2>&1)
+if [ ! -f "$WORK/db/sync/extra.db" ]; then
+  printf '%s\n' "$sync_log" | tail -3
+  fail "could not reach the Arch Linux ARM mirrors"
+fi
+
+install_pkgs() {
+  local name ver file out
+  out=$(pacman --config "$CONF" --dbpath "$WORK/db" --cachedir "$WORK/pkg" --noconfirm -Sw -dd "$@" 2>&1) \
+    || { echo "$out" | tail -4; fail "download of $* failed"; }
+  for name in "$@"; do
+    ver=$(pacman --config "$CONF" --dbpath "$WORK/db" -Sp --print-format '%v' -dd "$name" 2>/dev/null | tail -1)
+    file=$(ls "$WORK/pkg/$name-$ver-"*.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | head -1)
+    [ -n "$file" ] || fail "no package file for $name $ver"
+    bsdtar -xpf "$file" -C / --exclude .PKGINFO --exclude .BUILDINFO --exclude .MTREE --exclude .INSTALL \
+      || fail "could not unpack $name"
+    echo "== installed $name $ver"
+  done
+}
+
+step "Downloading lavapipe"
+install_pkgs vulkan-swrast
+
+for round in 1 2; do
+  missing=$(ldd /usr/lib/libvulkan_lvp.so 2>&1 | sed -n 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' | sort -u)
+  [ -n "$missing" ] || break
+  extra=()
+  for lib in $missing; do
+    case $lib in
+      libLLVM*) extra+=(llvm-libs) ;;
+      libSPIRV-Tools*) extra+=(spirv-tools) ;;
+      libxcb-*) extra+=(libxcb) ;;
+      libX11-xcb*) extra+=(libx11) ;;
+      libxshmfence*) extra+=(libxshmfence) ;;
+      libwayland-*) extra+=(wayland) ;;
+      libdrm*) extra+=(libdrm) ;;
+      libzstd*) extra+=(zstd) ;;
+      libelf*) extra+=(libelf) ;;
+      *) echo "== no package known for $lib" ;;
+    esac
+  done
+  [ "${#extra[@]}" -gt 0 ] && [ "$round" = 1 ] || break
+  step "Downloading what lavapipe links against"
+  install_pkgs $(printf '%s\n' "${extra[@]}" | sort -u)
+done
+find "$WORK/pkg" -type f -mtime +1 -delete 2>/dev/null
+
+if [ -n "$missing" ]; then
+  echo "$missing"
+  rm -f "$ICD"/lvp_icd*.json
+  fail "lavapipe is missing libraries"
+fi
+compgen -G "$ICD/lvp_icd*.json" >/dev/null || fail "the package has no lavapipe manifest"
+echo "== DONE $(ls "$ICD"/lvp_icd*.json)"
